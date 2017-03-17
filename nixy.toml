@@ -3,15 +3,17 @@ port = "6000"
 # X-Proxy header, defaults to hostname
 xproxy = ""
 # Marathon API
-marathon = ["http://example01:8080", "http://example02:8080"] # add all HA cluster nodes in priority order.
+marathon = ["http://192.168.99.100:8080"] # add all HA cluster nodes in priority order.
 user = "" # leave empty if no auth is required.
 pass = ""
 # Nginx
-nginx_config = "/etc/nginx/nginx.conf"
-nginx_template = "/etc/nginx/nginx.tmpl"
-nginx_cmd = "nginx" # optionally openresty
+nginx_config = "/tmp/nginx.conf"
+nginx_config_path = "/tmp/nginx_conf/"
+nginx_template = "/tmp/nginx.tmpl"
+nginx_template_path = "/tmp/nginx_tmpl/"
+nginx_cmd = "echo" # optionally openresty
 # Statsd settings
-[statsd]
-addr = "localhost:8125" # optional for statistics
+#[statsd]
+#addr = "localhost:8125" # optional for statistics
 #namespace = "nixy.my_mesos_cluster"
 #sample_rate = 100

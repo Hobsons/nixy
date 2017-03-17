@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -16,7 +17,8 @@ import (
 	"strings"
 	"text/template"
 	"time"
-
+	"crypto/md5"
+	"encoding/hex"
 	"github.com/Sirupsen/logrus"
 )
 
@@ -114,6 +116,7 @@ func eventStream() {
 				if !strings.HasPrefix(line, "event: ") {
 					continue
 				}
+				fmt.Println(line)
 				logger.WithFields(logrus.Fields{
 					"event":    strings.TrimSpace(line[6:]),
 					"endpoint": endpoint,
@@ -337,50 +340,108 @@ func syncApps(jsonapps *MarathonApps) bool {
 	}
 }
 
+func buildTemplate(filename string) (*template.Template, error) {
+	funcMap := template.FuncMap {
+        "service": func(ids ...string) []CTServiceTask {
+			ctTasks := []CTServiceTask{}
+			if len(ids) == 0 {
+				return ctTasks
+			}
+			id := "/" + ids[0]
+			if _, ok := config.Apps[id]; ok {
+    			for _, task := range config.Apps[id].Tasks {
+					ctTasks = append(ctTasks, CTServiceTask{
+					    Address: task.Host,
+						Port: task.Ports[0],
+						Ports: task.Ports,
+					})
+				}
+			}
+			return ctTasks
+		},
+		"services": func() []CTServiceApp {
+			ctApps := []CTServiceApp{}
+			for appId, _ := range config.Apps {
+				ctApps = append(ctApps,CTServiceApp{Name:appId[1:len(appId)]})
+			}
+			return ctApps
+		},		
+    }
+	template, err := template.New(filepath.Base(filename)).Funcs(funcMap).ParseFiles(filename)
+	return template, err
+}
+
+func getTemplates() []*template.Template {
+	temps := []*template.Template{}
+	if config.Nginx_template_path == "" {
+		template, err := buildTemplate(config.Nginx_template)
+		if err == nil {
+			temps = append(temps,template)
+		} else {
+			logger.WithFields(logrus.Fields{
+				"error": err.Error(),
+			}).Error("unable to load template")
+		}
+		return temps
+	} else {
+		paths, _ := filepath.Glob(config.Nginx_template_path + "*.tmpl")
+		for _, p := range paths {
+			t, err := buildTemplate(p)
+			if err == nil {
+				temps = append(temps, t)
+			} else {
+				logger.WithFields(logrus.Fields{
+					"error": err.Error(),
+				}).Error("unable to load template")
+			}
+		}
+		return temps
+    }		
+}
+
 func writeConf() error {
 	config.RLock()
 	defer config.RUnlock()
-	template, err := template.New(filepath.Base(config.Nginx_template)).ParseFiles(config.Nginx_template)
-	if err != nil {
-		return err
+	
+	for _, template := range getTemplates() {
+		fname := strings.Replace(template.Name(),"tmpl","conf",1)
+		conf_path := config.Nginx_config_path + fname
+		old_conf_path := config.Nginx_config_path + ".old." + fname
+		os.Rename(conf_path,old_conf_path)
+		f, _ := os.Create(conf_path)
+		err := template.Execute(f, config)
+		if err != nil {
+			os.Rename(old_conf_path, conf_path)
+		}
+		err = checkConf("")
+		if err != nil {
+			os.Rename(old_conf_path, conf_path)
+		}
 	}
 
-	parent := filepath.Dir(config.Nginx_config)
-	tmpFile, err := ioutil.TempFile(parent, ".nginx.conf.tmp-")
-	defer tmpFile.Close()
-
-	err = template.Execute(tmpFile, config)
-	if err != nil {
-		return err
-	}
 	config.LastUpdates.LastConfigRendered = time.Now()
-	err = checkConf(tmpFile.Name())
-	if err != nil {
-		return err
-	}
-	err = os.Rename(tmpFile.Name(), config.Nginx_config)
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
 func checkTmpl() error {
 	config.RLock()
 	defer config.RUnlock()
-	t, err := template.New(filepath.Base(config.Nginx_template)).ParseFiles(config.Nginx_template)
-	if err != nil {
-		return err
+	
+	for _, t := range getTemplates() {
+		err := t.Execute(ioutil.Discard, config)
+		if err != nil {
+			return err
+		}
 	}
-	err = t.Execute(ioutil.Discard, config)
-	if err != nil {
-		return err
-	}
+	
 	return nil
 }
 
 func checkConf(path string) error {
-	cmd := exec.Command(config.Nginx_cmd, "-c", path, "-t")
+	cmd := exec.Command(config.Nginx_cmd, "-t")
+	if path != "" {
+		cmd = exec.Command(config.Nginx_cmd, "-c", path, "-t")
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	err := cmd.Run() // will wait for command to return
@@ -405,6 +466,61 @@ func reloadNginx() error {
 	return nil
 }
 
+func fileMd5(path string) string {
+	var returnMD5String string
+	file, err := os.Open(path)
+	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"error": err.Error(),
+		}).Error("Could not open " + path)
+		return returnMD5String
+	}
+	defer file.Close()
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		logger.WithFields(logrus.Fields{
+			"error": err.Error(),
+		}).Error("Could not md5 hash " + path)
+		return returnMD5String
+	}
+	hashInBytes := hash.Sum(nil)[:16]
+	returnMD5String = hex.EncodeToString(hashInBytes)
+	return returnMD5String
+}
+
+func templateWatch() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		for _ = range ticker.C {
+			needsReload := false
+			paths, _ := filepath.Glob(config.Nginx_template_path + "*.tmpl")
+			for _, p := range paths {
+				finfo, _ := os.Stat(p)
+				lastModTime := finfo.ModTime()
+				if tstat, found := config.Templates[p]; found {
+					if lastModTime.After(tstat.modified) {
+						md5 := fileMd5(p)
+						tstat.modified = lastModTime
+						if md5 != tstat.md5 {
+							tstat.md5 = md5
+							needsReload = true
+						}
+						config.Templates[p] = tstat
+					}
+				} else {
+					md5 := fileMd5(p)
+					config.Templates[p] = TemplateStatus{modified:lastModTime, md5:md5}
+					needsReload = true
+				}
+			}
+			if needsReload {
+				logger.Info("Template files changed, reloading")
+				reloadConf()
+			}
+		}
+	}()
+}
+
 func reload() {
 	start := time.Now()
 	jsonapps := MarathonApps{}
@@ -422,7 +538,15 @@ func reload() {
 		return
 	}
 	config.LastUpdates.LastSync = time.Now()
-	err = writeConf()
+	reloadConf()
+	elapsed := time.Since(start)
+	logger.WithFields(logrus.Fields{
+		"took": elapsed,
+	}).Info("config updated")
+}
+
+func reloadConf() {	
+	err := writeConf()
 	if err != nil {
 		logger.WithFields(logrus.Fields{
 			"error": err.Error(),
@@ -439,12 +563,6 @@ func reload() {
 		go statsCount("reload.failed", 1)
 		return
 	}
-	elapsed := time.Since(start)
-	logger.WithFields(logrus.Fields{
-		"took": elapsed,
-	}).Info("config updated")
-	go statsCount("reload.success", 1)
-	go statsTiming("reload.time", elapsed)
 	config.LastUpdates.LastNginxReload = time.Now()
 	return
 }

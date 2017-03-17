@@ -40,6 +40,16 @@ type App struct {
 	PortDefinitions []PortDefinitions
 }
 
+type CTServiceTask struct {
+	Address string
+	Port int64
+	Ports []int64
+}
+
+type CTServiceApp struct {
+	Name string	
+}
+
 type Config struct {
 	sync.RWMutex
 	Xproxy         string
@@ -48,11 +58,19 @@ type Config struct {
 	User           string   `json:"-"`
 	Pass           string   `json:"-"`
 	Nginx_config   string   `json:"-"`
+	Nginx_config_path string `json:"-"`
 	Nginx_template string   `json:"-"`
+	Nginx_template_path string `json:"-"`
 	Nginx_cmd      string   `json:"-"`
 	Statsd         StatsdConfig
 	LastUpdates    Updates
 	Apps           map[string]App
+	Templates      map[string]TemplateStatus
+}
+
+type TemplateStatus struct {
+	modified time.Time
+	md5 string
 }
 
 type Updates struct {
@@ -198,6 +216,8 @@ func main() {
 		config.Xproxy, _ = os.Hostname()
 	}
 	statsd, _ = setupStatsd()
+	
+	config.Templates = make(map[string]TemplateStatus)
 
 	mux := mux.NewRouter()
 	mux.HandleFunc("/", nixy_version)
@@ -212,6 +232,7 @@ func main() {
 	endpointHealth()
 	eventStream()
 	eventWorker()
+	templateWatch()
 	logger.Info("starting nixy on :" + config.Port)
 	err = s.ListenAndServe()
 	if err != nil {
